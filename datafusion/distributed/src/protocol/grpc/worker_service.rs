@@ -19,7 +19,10 @@ use arrow_flight::encode::{DictionaryHandling, FlightDataEncoder, FlightDataEnco
 use arrow_flight::error::FlightError;
 use arrow_select::dictionary::garbage_collect_any_dictionary;
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions};
+use datafusion::arrow::array::{
+    Array, AsArray, GenericByteViewArray, RecordBatch, RecordBatchOptions,
+};
+use datafusion::arrow::datatypes::ByteViewType;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::ipc::CompressionType;
 use datafusion::arrow::ipc::writer::IpcWriteOptions;
@@ -488,10 +491,10 @@ fn garbage_collect_arrays(
         .map(|array| {
             if let Some(array) = array.as_any_dictionary_opt() {
                 garbage_collect_any_dictionary(array)
-            } else if let Some(array) = array.as_string_view_opt() {
-                Ok(Arc::new(array.gc()) as Arc<dyn Array>)
-            } else if let Some(array) = array.as_binary_view_opt() {
-                Ok(Arc::new(array.gc()) as Arc<dyn Array>)
+            } else if let Some(view_array) = array.as_string_view_opt() {
+                Ok(gc_byte_view(view_array).unwrap_or(array))
+            } else if let Some(view_array) = array.as_binary_view_opt() {
+                Ok(gc_byte_view(view_array).unwrap_or(array))
             } else {
                 Ok(array)
             }
@@ -503,6 +506,23 @@ fn garbage_collect_arrays(
         arrays,
         &RecordBatchOptions::new().with_row_count(Some(row_count)),
     )?)
+}
+
+/// Compacts the data buffers of a view array, or returns [None] if they are already compact.
+///
+/// [GenericByteViewArray::gc] copies every non-inlined value into a new buffer, even when the
+/// existing buffers hold nothing but referenced bytes, which is the usual case for batches coming
+/// out of a coalescing operator. Its output holds exactly
+/// [GenericByteViewArray::total_buffer_bytes_used] bytes, so when that already covers the
+/// current buffers, the copy cannot shrink what is sent over the network and is skipped.
+fn gc_byte_view<T: ByteViewType + ?Sized>(
+    array: &GenericByteViewArray<T>,
+) -> Option<Arc<dyn Array>> {
+    let buffers_len: usize = array.data_buffers().iter().map(|b| b.len()).sum();
+    if array.total_buffer_bytes_used() >= buffers_len {
+        return None;
+    }
+    Some(Arc::new(array.gc()))
 }
 
 /// Refuses a call whose task key headers do not name the [TaskKey] decoded from its body, so a
@@ -525,6 +545,8 @@ fn check_task_key_headers(metadata: &MetadataMap, task_key: &TaskKey) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::StringViewArray;
+    use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::physical_expr::expressions::lit;
     use datafusion::prelude::SessionContext;
 
@@ -551,6 +573,36 @@ mod tests {
         };
         assert_eq!(encoded.expression_id, 42);
         assert_eq!(encoded.expression_proto, expected);
+    }
+
+    #[test]
+    fn garbage_collect_arrays_copies_string_views_only_when_it_shrinks_them() {
+        let strings = StringViewArray::from_iter_values([
+            "a value that is too long to be inlined",
+            "another value that is too long to be inlined",
+        ]);
+        let gc_column = |array: StringViewArray| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::Utf8View,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+            let batch = garbage_collect_arrays(batch).unwrap();
+            batch.column(0).as_string_view().clone()
+        };
+
+        let compact = gc_column(strings.clone());
+        assert_eq!(compact.data_buffers(), strings.data_buffers());
+        assert_eq!(
+            compact.data_buffers()[0].as_ptr(),
+            strings.data_buffers()[0].as_ptr()
+        );
+
+        let sliced = gc_column(strings.slice(1, 1));
+        assert_eq!(sliced.data_buffers().len(), 1);
+        assert_eq!(sliced.data_buffers()[0].len(), 44);
+        assert_eq!(sliced.value(0), strings.value(1));
     }
 
     #[test]
